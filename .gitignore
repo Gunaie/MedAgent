@@ -1,0 +1,14 @@
+# 环境/缓存
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.idea/
+
+# 数据与日志
+data/db/
+chat_history/
+*.log
+
+# 敏感信息（如未使用环境变量时）
+.env
