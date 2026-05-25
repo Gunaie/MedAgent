@@ -4,6 +4,7 @@ import os
 import json
 import time
 import re
+import random
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote
@@ -13,20 +14,20 @@ from langchain_core.tools import tool
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 
-
 from models import get_llm_model
 from vector_store import similarity_search
-from config import GENERIC_PROMPT_TPL, RETRIEVAL_PROMPT_TPL, SEARCH_PROMPT_TPL
+from config import GENERIC_PROMPT_TPL, RETRIEVAL_PROMPT_TPL, SEARCH_PROMPT_TPL, SEARCH_CONFIG
 from neo4j_store import get_medical_graph
+from utils import get_logger
+
+logger = get_logger("medagent.tools")
 
 # ==================== 实体词典 ===================
-
 _entity_dict: set[str] = set()
 _entity_trie = None
 _ENTITY_CACHE_FILE = "./data/entity_dict.json"
 _entity_dict_loading = False
 _entity_dict_load_failed = False
-
 
 class _TrieNode:
     __slots__ = ['children', 'is_end', 'word']
@@ -34,7 +35,6 @@ class _TrieNode:
         self.children: Dict[str, '_TrieNode'] = {}
         self.is_end = False
         self.word = None
-
 
 class _EntityTrie:
     def __init__(self):
@@ -67,7 +67,6 @@ class _EntityTrie:
                 i += 1
         return found
 
-
 def _load_entity_dict():
     global _entity_dict, _entity_trie, _entity_dict_loading, _entity_dict_load_failed
     if _entity_trie is not None:
@@ -83,22 +82,27 @@ def _load_entity_dict():
             try:
                 with open(_ENTITY_CACHE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    _entity_dict = set(data)
+                _entity_dict = set(data)
+                _essential_entities = {"鼻炎", "高血压", "感冒", "糖尿病"}
+                if _essential_entities.issubset(_entity_dict):
                     _entity_trie = _EntityTrie()
                     for w in _entity_dict:
                         _entity_trie.add(w)
-                    print(f"[KG] Loaded {len(_entity_dict)} entities from local cache (Trie)")
+                    logger.info(f"Loaded {len(_entity_dict)} entities from local cache (Trie)")
                     return
+                else:
+                    missing = _essential_entities - _entity_dict
+                    logger.info(f"Cache incomplete (missing {missing}), refreshing from Neo4j...")
             except Exception as e:
-                print(f"[KG] Local cache read failed: {e}")
+                logger.warning(f"Local cache read failed: {e}")
 
         try:
             graph = get_medical_graph()
             cypher = """
-                MATCH (n:Disease|Symptom|Drug) 
-                WHERE n.name IS NOT NULL 
-                RETURN DISTINCT n.name as name 
-                LIMIT 5000
+            MATCH (n:Disease|Symptom|Drug)
+            WHERE n.name IS NOT NULL
+            RETURN DISTINCT n.name as name
+            ORDER BY n.name
             """
             with graph.driver.session() as session:
                 result = session.run(cypher)
@@ -106,16 +110,17 @@ def _load_entity_dict():
                 _entity_trie = _EntityTrie()
                 for w in _entity_dict:
                     _entity_trie.add(w)
-                print(f"[KG] Loaded {len(_entity_dict)} entities from Neo4j (Trie)")
+                logger.info(f"Loaded {len(_entity_dict)} entities from Neo4j (Trie)")
+                sample = sorted(list(_entity_dict))[:15]
+                logger.debug(f"Sample entities: {sample}")
                 os.makedirs(os.path.dirname(_ENTITY_CACHE_FILE), exist_ok=True)
                 with open(_ENTITY_CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(list(_entity_dict), f, ensure_ascii=False)
         except Exception as e:
-            print(f"[KG] Neo4j entity load failed (will not retry): {e}")
+            logger.error(f"Neo4j entity load failed (will not retry): {e}")
             _entity_dict_load_failed = True
     finally:
         _entity_dict_loading = False
-
 
 # ==================== 工具 ====================
 
@@ -125,7 +130,6 @@ def generic_func(query: str) -> str:
     prompt = PromptTemplate.from_template(GENERIC_PROMPT_TPL)
     chain = prompt | get_llm_model() | StrOutputParser()
     return chain.invoke({"query": query})
-
 
 @tool
 def retrieval_func(query: str) -> str:
@@ -143,16 +147,14 @@ def retrieval_func(query: str) -> str:
         "context": "\n\n".join(truncated) if truncated else "没有查到",
     })
 
-
-# 搜索失败时由大模型自身知识兜底
 @tool
 def search_func(query: str) -> str:
     """通过搜索引擎回答通用类问题（非医疗问题）。搜索失败时由大模型自身知识回答。"""
-    search_results = baidu_search(query, num_results=5, timeout=3.0)
+    search_results = cached_search(query)
 
     if search_results:
         formatted_results = "\n\n".join([
-            f"标题：{r['title']}\n摘要：{r['abstract']}"
+            f"[{r.get('source', 'web').upper()}] {r['title']}\n{r['abstract']}"
             for r in search_results[:3]
         ])
         prompt = PromptTemplate.from_template(SEARCH_PROMPT_TPL)
@@ -162,8 +164,7 @@ def search_func(query: str) -> str:
             "query_result": formatted_results,
         })
 
-    # 搜索无结果：直接让 LLM 回答（非医疗问题的最终兜底）
-    print(f"[SEARCH] No results for: {query}, falling back to LLM")
+    logger.info(f"No search results for: {query}, falling back to LLM")
     fallback_prompt = """请用中文简洁回答用户问题。如果问题涉及医疗诊断，请回复"抱歉，我无法提供医疗诊断建议，请咨询专业医生。"。
 用户问题：{query}
 """
@@ -171,8 +172,7 @@ def search_func(query: str) -> str:
     chain = prompt | get_llm_model() | StrOutputParser()
     return chain.invoke({"query": query})
 
-
-# ==================== 快速格式化（零 LLM）====================
+# ==================== 快速格式化 ====================
 
 def _format_drug_response(disease_name: str, drugs: List[Dict], drug_entities: List[str]) -> str:
     parts = []
@@ -194,17 +194,14 @@ def _format_drug_response(disease_name: str, drugs: List[Dict], drug_entities: L
     parts.append("以上信息仅供参考，具体用药请遵医嘱。")
     return "".join(parts)
 
-
 def _format_symptom_response(disease_name: str, symptoms: List[str]) -> str:
     if symptoms:
         return f"{disease_name}的症状包括：{', '.join(symptoms[:5])}。"
     return f"图谱中未记录{disease_name}的详细症状。"
 
-
 # ==================== 实体抽取 ====================
 
 def _llm_ner_extract(query: str) -> list[str]:
-    """LLM 兜底实体抽取：仅当 Trie 未命中时调用一次"""
     prompt_text = f"""从以下用户输入中抽取医疗实体，仅输出 JSON 格式，不要任何其他内容。
 JSON 格式要求：{{"disease": ["疾病名"], "symptom": ["症状名"], "drug": ["药品名"]}}
 如果没有任何医疗实体，三个字段全部留空列表 []。
@@ -217,24 +214,64 @@ JSON 格式要求：{{"disease": ["疾病名"], "symptom": ["症状名"], "drug"
         llm = get_llm_model()
         response = llm.invoke(prompt_text)
         content = response.content if hasattr(response, "content") else str(response)
+        logger.debug(f"LLM raw output: {content[:200]}")
         match = re.search(r"\{{.*?\}}", content, re.DOTALL)
         if not match:
+            logger.debug("No JSON found in LLM output")
             return []
         data = json.loads(match.group())
-        entities = []
+        raw_entities = []
         for key in ("disease", "symptom", "drug"):
-            entities.extend(data.get(key, []))
-        cleaned = [e.strip() for e in entities if isinstance(e, str) and len(e) > 1 and not e.isdigit()]
-        return cleaned
+            raw_entities.extend(data.get(key, []))
+        logger.debug(f"LLM extracted raw: {raw_entities}")
+        return _map_to_graph_entities(raw_entities)
     except Exception as e:
-        print(f"[NER] LLM 兜底抽取失败: {e}")
+        logger.warning(f"LLM NER fallback failed: {e}")
         return []
 
+def _fuzzy_search_entity(name: str, limit: int = 5) -> List[str]:
+    graph = get_medical_graph()
+    results = graph.search_entities(name, limit=limit)
+    candidates = []
+    for r in results:
+        candidate = r["name"]
+        if name in candidate or candidate in name:
+            candidates.append(candidate)
+    return candidates
+
+def _map_to_graph_entities(raw_entities: List[str]) -> List[str]:
+    _load_entity_dict()
+    mapped = []
+    for raw in raw_entities:
+        raw = raw.strip()
+        if len(raw) <= 1 or raw.isdigit():
+            continue
+
+        if raw in _entity_dict:
+            mapped.append(raw)
+            continue
+
+        fuzzy_matches = _fuzzy_search_entity(raw, limit=3)
+        if fuzzy_matches:
+            best = fuzzy_matches[0]
+            logger.info(f"Entity alias mapping: '{raw}' -> '{best}'")
+            mapped.append(best)
+            continue
+
+        logger.debug(f"Entity not in graph: '{raw}'")
+
+    seen = set()
+    unique = []
+    for e in mapped:
+        if e not in seen:
+            seen.add(e)
+            unique.append(e)
+    return unique
 
 def _extract_entities_fast(query: str) -> list[str]:
-    """【Fast 档】仅 Trie 匹配，不触发 LLM"""
     if _entity_trie is None:
         return []
+
     found = _entity_trie.search(query)
     seen = set()
     unique = []
@@ -242,26 +279,50 @@ def _extract_entities_fast(query: str) -> list[str]:
         if e not in seen:
             seen.add(e)
             unique.append(e)
+        if len(unique) >= 3:
+            break
+
+    if not unique:
+        graph = get_medical_graph()
+        segments = re.findall(r'[\u4e00-\u9fff]+', query)
+        candidates = []
+        for seg in segments:
+            for length in range(min(10, len(seg)), 1, -1):
+                for i in range(len(seg) - length + 1):
+                    candidates.append(seg[i:i+length])
+
+        seen_cands = set()
+        for cand in candidates:
+            if cand in seen_cands:
+                continue
+            seen_cands.add(cand)
+
+            fuzzy_results = graph.search_entities(cand, limit=3)
+            for r in fuzzy_results:
+                name = r["name"]
+                if name not in seen:
+                    if cand in name or name in cand:
+                        seen.add(name)
+                        unique.append(name)
+                        logger.info(f"Fast-path fuzzy match: '{cand}' -> '{name}'")
+                        if len(unique) >= 3:
+                            break
             if len(unique) >= 3:
                 break
+
     return unique
 
-
 def _extract_entities(query: str) -> list[str]:
-    """【Full 档】Trie 匹配 + LLM 兜底"""
     _load_entity_dict()
     entities = _extract_entities_fast(query)
     if entities:
         return entities
-    print(f"[NER] Trie 未命中，启动 LLM 兜底: {query}")
+    logger.info(f"Trie miss, starting LLM NER fallback: {query}")
     return _llm_ner_extract(query)
-
 
 # ==================== 模板快速路径 ====================
 
-# FIX: 过滤掉返回"暂无记录"的伪命中
 def _try_template_fast_path(graph, query: str) -> str | None:
-    """模板快速路径：Trie 实体 + 意图关键词，零 LLM"""
     if _entity_trie is None:
         return None
 
@@ -272,74 +333,59 @@ def _try_template_fast_path(graph, query: str) -> str | None:
     q = query.lower()
     intent_configs = [
         ("symptom", ["症状", "表现", "征象", "有什么感觉", "不舒服"]),
-        ("cure_way", ["药", "治疗", "怎么治", "吃什么", "服用", "疗法", "能治"]),
+        ("cure_way", ["药", "吃什么", "服用", "药物", "吃药", "用药"]),
+        ("cure_method", ["治疗", "怎么治", "疗法", "手术", "能治", "医治"]),
         ("cause", ["引起", "病因", "原因", "为什么", "导致的"]),
         ("desc", ["是什么", "什么叫", "什么是", "的定义", "是一种什么"]),
         ("check", ["检查", "化验", "拍片", "做哪些", "查什么"]),
         ("department", ["科室", "挂什么科", "看什么科", "哪个科", "门诊"]),
         ("cured_prob", ["治好", "治愈率", "预后", "几率", "能好吗"]),
-        ("indications", ["治什么病", "适应症", "治哪些", "能治", "可以吃", "能吃", "管用"]),
+        ("indications", ["治什么病", "适应症", "治哪些", "能吃", "管用", "适用"]),
+        ("prevent", ["预防", "防止", "避免"]),
     ]
 
     for template_key, keywords in intent_configs:
         if any(kw in q for kw in keywords):
             for entity in entities[:2]:
                 result = graph.query_by_template(template_key, entity)
-                # FIX: 过滤空结果的伪命中
                 if result and "暂无记录" not in result:
-                    print(f"[KG] 模板精确命中: {template_key}, 实体: {entity}")
+                    logger.info(f"Template exact hit: {template_key}, entity: {entity}")
                     return result
                 result = graph.query_by_template(template_key, entity, fuzzy=True)
                 if result and "暂无记录" not in result:
-                    print(f"[KG] 模板模糊命中: {template_key}, 实体: {entity}")
+                    logger.info(f"Template fuzzy hit: {template_key}, entity: {entity}")
                     return result
     return None
 
-
-# ==================== 知识图谱工具（修复版）====================
+# ==================== 知识图谱工具 ====================
 
 @tool
 def kg_query_func(query: str) -> str:
     """用于回答疾病、症状、药物之间的医学关联关系，基于医疗知识图谱"""
     graph = get_medical_graph()
 
-    # 1. 模板快速路径（零 LLM）
     fast_result = _try_template_fast_path(graph, query)
     if fast_result:
         return fast_result
 
-    # 2. 实体抽取（Trie + LLM 兜底）
     entities = _extract_entities(query)
     if not entities:
         return "未识别到医疗实体，无法查询知识图谱。"
 
-    # 3. 区分疾病和药物
-    disease_entities = []
-    drug_entities = []
-    for ent in entities:
-        try:
-            symptoms = graph.query_disease_symptoms(ent)
-            if symptoms:
-                disease_entities.append(ent)
-                continue
-        except Exception:
-            pass
-        try:
-            diseases = graph.query_drug_diseases(ent)
-            if diseases:
-                drug_entities.append(ent)
-                continue
-        except Exception:
-            pass
-        # 无法判断，默认当疾病
-        disease_entities.append(ent)
+    entity_types = graph.get_entity_types(entities)
+    disease_entities = [e for e in entities if entity_types.get(e) == "Disease"]
+    drug_entities = [e for e in entities if entity_types.get(e) == "Drug"]
+    symptom_entities = [e for e in entities if entity_types.get(e) == "Symptom"]
 
-    # 4. 判断意图
+    untyped = [e for e in entities if e not in entity_types]
+    if untyped:
+        logger.warning(f"Unrecognized entities (defaulting to Disease): {untyped}")
+        disease_entities.extend(untyped)
+
     q = query.lower()
     has_drug_intent = any(k in q for k in ["药", "吃什么", "用药", "治疗", "能吃", "服用", "可以吃"])
     has_symptom_intent = any(k in q for k in ["症状", "表现", "征象", "有什么"])
 
-    # 当同时有疾病和药品，且问"能否/可以吃"时，查药品适应症并交叉验证
     if disease_entities and drug_entities and any(k in q for k in ["可以吃", "能吃", "能用", "管用", "适合"]):
         drug_name = drug_entities[0]
         disease_name = disease_entities[0]
@@ -348,12 +394,10 @@ def kg_query_func(query: str) -> str:
             if disease_name in indications:
                 return f"【{disease_name}】可以吃{drug_name}。{indications} 具体用药请遵医嘱。"
             else:
-                # FIX: 不列出所有无关适应症，只简短说明
                 return f"【{disease_name}】图谱未明确记录{drug_name}可用于治疗{disease_name}。具体用药请遵医嘱。"
         else:
             return f"图谱中未记录{drug_name}的适应症信息，无法确认是否适用于{disease_name}。具体用药请遵医嘱。"
 
-    # 快速路径 — 明确用药查询，支持"只有疾病"或"只有药品"
     if has_drug_intent:
         if disease_entities:
             all_drugs = []
@@ -362,17 +406,16 @@ def kg_query_func(query: str) -> str:
                 if drugs:
                     all_drugs.extend(drugs)
             if all_drugs or drug_entities:
-                print("[KG] 快速路径: 疾病药物查询，跳过 LLM")
+                logger.info("Fast path: disease drug query, skipping LLM")
                 return _format_drug_response(disease_entities[0], all_drugs, drug_entities)
         elif drug_entities:
-            # 只有药品实体，查适应症
             indications_results = []
             for ent in drug_entities:
                 ind = graph.query_by_template("indications", ent)
                 if ind and "暂无记录" not in ind:
                     indications_results.append(ind)
             if indications_results:
-                print("[KG] 快速路径: 药品适应症查询，跳过 LLM")
+                logger.info("Fast path: drug indications query, skipping LLM")
                 return "\n".join(indications_results)
 
     if has_symptom_intent and disease_entities:
@@ -382,10 +425,9 @@ def kg_query_func(query: str) -> str:
             if symptoms:
                 all_symptoms.extend(symptoms)
         if all_symptoms:
-            print("[KG] 快速路径: 症状查询，跳过 LLM")
+            logger.info("Fast path: symptom query, skipping LLM")
             return _format_symptom_response(disease_entities[0], all_symptoms)
 
-    # 5. 复杂查询：收集上下文，LLM 整理兜底
     contexts = []
     max_context_items = 6
 
@@ -397,12 +439,12 @@ def kg_query_func(query: str) -> str:
                     rels = sg.get("rels", [])
                     for rel in rels[:1]:
                         contexts.append(f"{rel['from']} -> {rel['type']} -> {rel['to']}")
-                        if len(contexts) >= max_context_items:
-                            break
                     if len(contexts) >= max_context_items:
                         break
+                if len(contexts) >= max_context_items:
+                    break
         except Exception as e:
-            print(f"[KG] Subgraph query failed for {ent}: {e}")
+            logger.warning(f"Subgraph query failed for {ent}: {e}")
 
     if has_drug_intent:
         for ent in disease_entities:
@@ -412,7 +454,7 @@ def kg_query_func(query: str) -> str:
                     drug_str = ", ".join([d["name"] for d in drugs[:3]])
                     contexts.append(f"【{ent}】相关药物：{drug_str}")
             except Exception as e:
-                print(f"[KG] Drug query failed for {ent}: {e}")
+                logger.warning(f"Drug query failed for {ent}: {e}")
         for ent in drug_entities:
             try:
                 diseases = graph.query_drug_diseases(ent)
@@ -420,7 +462,7 @@ def kg_query_func(query: str) -> str:
                     dis_str = ", ".join([d["name"] for d in diseases[:3]])
                     contexts.append(f"【{ent}】用于治疗：{dis_str}")
             except Exception as e:
-                print(f"[KG] Drug-disease query failed for {ent}: {e}")
+                logger.warning(f"Drug-disease query failed for {ent}: {e}")
 
     if has_symptom_intent:
         for ent in disease_entities:
@@ -429,12 +471,11 @@ def kg_query_func(query: str) -> str:
                 if symptoms:
                     contexts.append(f"【{ent}】症状：{', '.join(symptoms[:5])}")
             except Exception as e:
-                print(f"[KG] Symptom query failed for {ent}: {e}")
+                logger.warning(f"Symptom query failed for {ent}: {e}")
 
     if not contexts:
         return "知识图谱中未找到相关信息。"
 
-    # 6. LLM 整理（兜底）
     prompt = PromptTemplate.from_template("""\
 请根据以下医疗知识图谱信息，用简洁语言回答用户问题（100字以内）。不要编造。
 
@@ -450,94 +491,251 @@ def kg_query_func(query: str) -> str:
             "kg_context": "\n".join(contexts[:6]),
         })
     except Exception as e:
-        print(f"[KG] LLM 整理失败: {e}")
+        logger.error(f"LLM summarization failed: {e}")
         return "图谱信息：" + "；".join(contexts[:3])
 
+# ==================== 搜索模块 ====================
 
-# ==================== 搜索 ====================
+def _get_random_ua() -> str:
+    return random.choice(SEARCH_CONFIG["user_agents"])
 
-# FIX: 超时放宽到 3 秒
-def baidu_search(query: str, num_results: int = 10, timeout: float = 3.0) -> list[dict]:
-    """百度搜索（网页抓取）"""
+def _is_valid_result(title: str, abstract: str) -> bool:
+    if len(title) < 3:
+        return False
+    junk_keywords = ["百度首页", "登录", "注册", "更多", "设置", "地图", "贴吧"]
+    if any(kw in title for kw in junk_keywords):
+        return False
+    return len(abstract) > 10 or "电话" in title or "客服" in title
+
+def _search_duckduckgo(query: str, num_results: int = 5, timeout: float = 5.0) -> List[Dict]:
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+        headers = {
+            "User-Agent": _get_random_ua(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.encoding = 'utf-8'
+
+        if response.status_code != 200:
+            logger.warning(f"DuckDuckGo status: {response.status_code}")
+            return []
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = []
+
+        for result in soup.select('.result'):
+            title_elem = result.select_one('.result__a')
+            abstract_elem = result.select_one('.result__snippet')
+
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+                abstract = abstract_elem.get_text(strip=True) if abstract_elem else ""
+                href = title_elem.get('href', '')
+
+                if _is_valid_result(title, abstract):
+                    results.append({
+                        "title": title,
+                        "abstract": abstract,
+                        "url": href,
+                        "source": "duckduckgo"
+                    })
+                    if len(results) >= num_results:
+                        break
+
+        logger.info(f"DuckDuckGo found {len(results)} results for: {query}")
+        return results
+    except Exception as e:
+        logger.warning(f"DuckDuckGo error: {e}")
+        return []
+
+def _search_bing(query: str, num_results: int = 5, timeout: float = 5.0) -> List[Dict]:
+    try:
+        url = f"https://www.bing.com/search?q={quote(query)}&count={num_results}"
+        headers = {
+            "User-Agent": _get_random_ua(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": "https://www.bing.com/",
+        }
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.encoding = 'utf-8'
+
+        if response.status_code != 200:
+            logger.warning(f"Bing status: {response.status_code}")
+            return []
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = []
+
+        for li in soup.select('.b_algo'):
+            title_elem = li.select_one('h2 a')
+            abstract_elem = li.select_one('.b_caption p') or li.select_one('.b_snippet')
+
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+                abstract = abstract_elem.get_text(strip=True) if abstract_elem else ""
+                href = title_elem.get('href', '')
+
+                if _is_valid_result(title, abstract):
+                    results.append({
+                        "title": title,
+                        "abstract": abstract,
+                        "url": href,
+                        "source": "bing"
+                    })
+                    if len(results) >= num_results:
+                        break
+
+        logger.info(f"Bing found {len(results)} results for: {query}")
+        return results
+    except Exception as e:
+        logger.warning(f"Bing error: {e}")
+        return []
+
+def _search_baidu(query: str, num_results: int = 5, timeout: float = 5.0) -> List[Dict]:
     try:
         search_queries = [query, f"{query} 官方"]
         all_results = []
+
         for sq in search_queries[:2]:
             url = f"https://www.baidu.com/s?wd={quote(sq)}"
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": _get_random_ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "Referer": "https://www.baidu.com/",
+                "Connection": "keep-alive",
             }
+
+            time.sleep(SEARCH_CONFIG.get("delay_between_requests", 0.5) * random.random())
+
             response = requests.get(url, headers=headers, timeout=timeout)
             response.encoding = 'utf-8'
+
             if response.status_code != 200:
+                logger.warning(f"Baidu status: {response.status_code}")
                 continue
+
+            if "verify" in response.text.lower() or "security" in response.text.lower():
+                logger.warning("Baidu anti-bot detected, skipping...")
+                continue
+
             soup = BeautifulSoup(response.text, 'html.parser')
-            selectors = ['.result', '.c-container', '[tpl]', '.c-result']
+
+            selectors = [
+                '.result',
+                '.c-container',
+                '[tpl]',
+                '.c-result',
+                '#content_left > div',
+            ]
+
             containers = []
             for selector in selectors:
                 containers = soup.select(selector)
                 if containers:
+                    logger.debug(f"Baidu using selector: {selector}")
                     break
+
             for container in containers:
                 title_elem = (
                     container.select_one('h3 a') or
                     container.select_one('.t a') or
                     container.select_one('a[data-click]') or
+                    container.select_one('.title_3M1bj a') or
                     container.select_one('a')
                 )
+
                 abstract_elem = (
                     container.select_one('.content-right_8Zs40') or
                     container.select_one('.c-abstract') or
                     container.select_one('.content-right') or
+                    container.select_one('.abstract_3Qj1C') or
+                    container.select_one('span[class*="abstract"]') or
                     container.select_one('p')
                 )
+
                 if title_elem:
                     title = title_elem.get_text(strip=True)
                     abstract = abstract_elem.get_text(strip=True) if abstract_elem else ""
-                    if len(title) > 5 and (len(abstract) > 20 or '电话' in title or '客服' in title):
-                        result = {"title": title, "abstract": abstract}
+                    href = title_elem.get('href', '')
+
+                    if _is_valid_result(title, abstract):
+                        result = {
+                            "title": title,
+                            "abstract": abstract,
+                            "url": href,
+                            "source": "baidu"
+                        }
                         if not any(r['title'] == title for r in all_results):
                             all_results.append(result)
-                            if len(all_results) >= num_results:
-                                break
+
+                    if len(all_results) >= num_results:
+                        break
+
             if len(all_results) >= num_results:
                 break
-        print(f"[SEARCH] Baidu found {len(all_results)} results for: {query}")
-        return all_results
+
+        logger.info(f"Baidu found {len(all_results)} results for: {query}")
+        return results
+
     except requests.exceptions.Timeout:
-        print(f"[SEARCH] Baidu timeout (> {timeout}s), skipping...")
+        logger.warning(f"Baidu timeout (> {timeout}s), skipping...")
         return []
     except Exception as e:
-        print(f"[SEARCH] Baidu error: {e}")
+        logger.warning(f"Baidu error: {e}")
         return []
 
+def _search_all(query: str, num_results: int = 5, timeout: float = 5.0) -> List[Dict]:
+    engines = SEARCH_CONFIG.get("engines", ["duckduckgo", "bing", "baidu"])
+    all_results = []
+    seen_titles = set()
+
+    for engine in engines:
+        if len(all_results) >= num_results:
+            break
+
+        remaining = num_results - len(all_results)
+
+        if engine == "duckduckgo":
+            results = _search_duckduckgo(query, remaining, timeout)
+        elif engine == "bing":
+            results = _search_bing(query, remaining, timeout)
+        elif engine == "baidu":
+            results = _search_baidu(query, remaining, timeout)
+        else:
+            continue
+
+        for r in results:
+            if r["title"] not in seen_titles:
+                seen_titles.add(r["title"])
+                all_results.append(r)
+                if len(all_results) >= num_results:
+                    break
+
+    logger.info(f"Total results from {len(set(r['source'] for r in all_results))} engines: {len(all_results)}")
+    return all_results
 
 _search_cache: Dict[str, tuple] = {}
 _CACHE_TTL = 300
 
-
-def cached_search(query: str, search_func_name: str = "baidu") -> list[dict]:
-    """带缓存 + TTL 的搜索"""
+def cached_search(query: str, search_func_name: str = "all") -> List[Dict]:
     cache_key = f"{search_func_name}:{query}"
     now = time.time()
     if cache_key in _search_cache:
         result, ts = _search_cache[cache_key]
         if now - ts < _CACHE_TTL:
-            print(f"[CACHE] Search hit: {cache_key}")
+            logger.debug(f"Search cache hit: {cache_key}")
             return result
-    if search_func_name == "baidu":
-        results = baidu_search(query)
-    else:
-        results = []
+
+    results = _search_all(query) if search_func_name == "all" else []
     _search_cache[cache_key] = (results, now)
     return results
-
 
 # ==================== 启动预加载 ====================
 try:
     _load_entity_dict()
 except Exception as e:
-    print(f"[KG] Startup entity preload skipped: {e}")
+    logger.warning(f"Startup entity preload skipped: {e}")

@@ -2,12 +2,16 @@
 
 import gradio as gr
 import uuid
+from cachetools import TTLCache
+
 from service import ChatService
 
-_service_cache = {}
+# FIX: TTL + LRU 缓存，1小时过期，最多1000个会话，防止内存泄漏
+_service_cache: TTLCache = TTLCache(maxsize=1000, ttl=3600)
 
 
 def get_service(session_id: str) -> ChatService:
+    """获取或创建会话服务，自动清理过期会话"""
     if session_id not in _service_cache:
         _service_cache[session_id] = ChatService(session_id=session_id)
     return _service_cache[session_id]
@@ -52,7 +56,6 @@ with gr.Blocks() as demo:
             "鼻炎是一种什么病？",
             "一般会有哪些症状？",
             "吃什么药好得快？可以吃阿莫西林吗？",
-            "刀郎最近有什么新专辑？",
         ],
         inputs=msg,
     )
