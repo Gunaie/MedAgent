@@ -4,15 +4,24 @@ import os
 import sys
 from glob import glob
 
+# FIX: 强制使用本文件所在目录推导项目根目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+# 如果本文件在项目根目录，PROJECT_ROOT = SCRIPT_DIR
+# 如果本文件在 scripts/，PROJECT_ROOT = 上级目录
+if os.path.basename(SCRIPT_DIR) == 'scripts':
+    PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+else:
+    PROJECT_ROOT = SCRIPT_DIR
+
 sys.path.insert(0, PROJECT_ROOT)
 
 from langchain_community.document_loaders import CSVLoader, PyMuPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from vector_store import add_documents_to_store, PROJECT_ROOT
+from vector_store import add_documents_to_store
 
+print(f"[DEBUG] Script directory: {SCRIPT_DIR}")
+print(f"[DEBUG] Project root: {PROJECT_ROOT}")
 
 def load_and_split_documents(data_dir: str | None = None) -> list:
     """加载并分割文档"""
@@ -20,7 +29,8 @@ def load_and_split_documents(data_dir: str | None = None) -> list:
         data_dir = os.path.join(PROJECT_ROOT, "data", "inputs")
 
     print(f"[DataProcess] 扫描目录: {data_dir}")
-    print(f"[DataProcess] 匹配到的文件: {glob(os.path.join(data_dir, '*.*'))}")
+    files = glob(os.path.join(data_dir, "*.*"))
+    print(f"[DataProcess] 匹配到的文件: {files}")
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=300,
@@ -29,7 +39,7 @@ def load_and_split_documents(data_dir: str | None = None) -> list:
     )
 
     documents = []
-    for file_path in glob(os.path.join(data_dir, "*.*")):
+    for file_path in files:
         loader = None
         if file_path.endswith(".csv"):
             loader = CSVLoader(file_path, encoding="utf-8")
@@ -58,6 +68,12 @@ def build_vector_database(data_dir: str | None = None, persist_dir: str | None =
         return
 
     print(f"📄 共加载 {len(docs)} 个文档片段，准备向量化...")
+
+    # FIX: 强制传入绝对路径
+    if persist_dir is None:
+        persist_dir = os.path.join(PROJECT_ROOT, "data", "db")
+
+    print(f"[DEBUG] Vector store path: {persist_dir}")
     add_documents_to_store(docs, persist_dir)
 
 

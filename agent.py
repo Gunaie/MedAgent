@@ -1,66 +1,52 @@
-"""ReAct Agent"""
+"""LangChain ReAct Agent 定义"""
 
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain_core.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
 
 from models import get_llm_model
-from tools import generic_func, retrieval_func, search_func, kg_query_func
+from tools import generic_func, retrieval_func, kg_query_func, search_func
+from config import TOOL_DESCRIPTIONS
 
+# 定义 ReAct 提示词模板
+AGENT_PROMPT = """尽你所能回答以下问题。你可以使用以下工具：
 
-def create_medical_agent(verbose: bool = False):
-    """创建医疗问诊 Agent"""
-
-    tools = [generic_func, retrieval_func, kg_query_func, search_func]
-
-    # 优化 ReAct 提示词，明确告诉模型收到 Observation 后必须直接 Final Answer
-    template = """\
-请用中文回答问题！Final Answer 必须尊重 Observation 的结果，不能改变语义。
-如果 Observation 已经包含答案，你必须立即输出 Final Answer，不要再次调用工具。
-
-你有以下工具可以使用：
 {tools}
 
-使用以下格式：
+请使用以下格式：
 
-Question: 你需要回答的问题
-Thought: 你应该始终思考该做什么
-Action: 要采取的行动，必须是以下之一 [{tool_names}]
-Action Input: 行动的输入
-Observation: 行动的结果
-...（这个 Thought/Action/Action Input/Observation 可以重复 N 次）
-Thought: 我现在知道最终答案了
-Final Answer: 对原始问题的最终答案
+问题：你必须回答的输入问题
+思考：你应该始终思考该怎么做
+行动：要采取的行动，应该是 [{tool_names}] 之一
+行动输入：行动的输入
+观察：行动的结果
+...（这个思考/行动/行动输入/观察可以重复 N 次）
+思考：我现在知道最终答案了
+最终答案：对原始问题的最终答案
 
-Begin!
+开始！
 
-Previous conversation history:
-{chat_history}
-
-Question: {input}
-Thought:{agent_scratchpad}
+问题：{input}
+{agent_scratchpad}
 """
 
-    prompt = PromptTemplate.from_template(template)
+def get_agent():
+    """创建 ReAct Agent"""
+    tools = [generic_func, retrieval_func, kg_query_func, search_func]
+    tool_names = [t.name for t in tools]
 
-    agent = create_react_agent(
-        llm=get_llm_model(),
-        tools=tools,
-        prompt=prompt,
+    prompt = PromptTemplate.from_template(AGENT_PROMPT).partial(
+        tools="\n".join([f"{t.name}: {TOOL_DESCRIPTIONS.get(t.name, t.description)}" for t in tools]),
+        tool_names=", ".join(tool_names),
     )
 
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-    )
+    llm = get_llm_model()
+    agent = create_react_agent(llm, tools, prompt)
 
-    return AgentExecutor.from_agent_and_tools(
+    return AgentExecutor(
         agent=agent,
         tools=tools,
-        memory=memory,
+        verbose=True,
+        max_iterations=2,  # 限制迭代次数，防止无限循环
+        max_execution_time=30,  # 30秒超时
         handle_parsing_errors=True,
-        verbose=verbose,
-        max_iterations=2,        # 最多迭代 2 次（决策1次 + 总结1次）
-        max_execution_time=20,   # 整个 Agent 执行不超过 20 秒
-        early_stopping_method="generate",  # 超时或达到迭代上限时，让 LLM 直接生成答案
     )

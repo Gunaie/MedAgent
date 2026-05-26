@@ -131,20 +131,27 @@ def generic_func(query: str) -> str:
     chain = prompt | get_llm_model() | StrOutputParser()
     return chain.invoke({"query": query})
 
+
 @tool
 def retrieval_func(query: str) -> str:
     """用于回答寻医问药网相关问题，基于企业内部文档"""
-    contexts = similarity_search(query, k=3, score_threshold=0.6)
+    # FIX: 降低阈值到 0.3，增加 k 到 5
+    contexts = similarity_search(query, k=5, score_threshold=0.3)
+
+    if not contexts:
+        return "抱歉，暂时没有找到相关信息。"
+
     truncated = []
     for ctx in contexts:
         if len(ctx) > 200:
             ctx = ctx[:200] + "..."
         truncated.append(ctx)
+
     prompt = PromptTemplate.from_template(RETRIEVAL_PROMPT_TPL)
     chain = prompt | get_llm_model() | StrOutputParser()
     return chain.invoke({
         "query": query,
-        "context": "\n\n".join(truncated) if truncated else "没有查到",
+        "context": "\n\n".join(truncated),
     })
 
 @tool

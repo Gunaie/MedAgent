@@ -1,40 +1,45 @@
-"""Gradio 前端（用 State 保存 session_id）"""
+"""Gradio 前端"""
+
+import os
+# FIX: 在导入任何可能加载 ChromaDB 的模块之前，彻底禁用遥测
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 import gradio as gr
 import uuid
 from cachetools import TTLCache
 
 from service import ChatService
+from utils import get_logger
 
-# FIX: TTL + LRU 缓存，1小时过期，最多1000个会话，防止内存泄漏
+logger = get_logger("medagent.app")
+
 _service_cache: TTLCache = TTLCache(maxsize=1000, ttl=3600)
 
-
 def get_service(session_id: str) -> ChatService:
-    """获取或创建会话服务，自动清理过期会话"""
     if session_id not in _service_cache:
         _service_cache[session_id] = ChatService(session_id=session_id)
+        logger.info(f"New session created: {session_id}")
     return _service_cache[session_id]
-
 
 def doctor_bot(message: str, history: list[dict], session_id: str):
     if not session_id:
         session_id = f"user_{uuid.uuid4().hex[:8]}"
-        print(f"[Session] New session created: {session_id}")
+        logger.info(f"New session initialized: {session_id}")
     else:
-        print(f"[Session] Using existing session: {session_id}")
+        logger.debug(f"Using existing session: {session_id}")
 
     service = get_service(session_id)
+    logger.info(f"User query: {message}")
+
     response = service.answer(message)
+    logger.info(f"Bot response: {response[:100]}...")
 
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": response})
     return history, "", session_id
 
-
 def clear_chat():
     return [], "", ""
-
 
 with gr.Blocks() as demo:
     gr.Markdown("# 医疗问诊机器人")
@@ -65,9 +70,10 @@ with gr.Blocks() as demo:
     clear_btn.click(clear_chat, inputs=None, outputs=[chatbot, msg, session_state])
 
 if __name__ == "__main__":
-    import uvicorn
-    from fastapi import FastAPI
-
-    app = FastAPI()
-    demo = gr.mount_gradio_app(app, demo, path="/")
-    uvicorn.run(app, host="127.0.0.1", port=7860, log_level="info")
+    # FIX: 直接使用 Gradio 的 launch，不再用 FastAPI/uvicorn 包装
+    logger.info("Starting MedAgent server on http://127.0.0.1:7860")
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        show_error=True,
+    )

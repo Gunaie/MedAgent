@@ -2,75 +2,107 @@
 
 import os
 from pathlib import Path
+from typing import List
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
+import chromadb
+from chromadb.config import Settings
 
-from models import get_embeddings_model
+from models import embed_texts
 from utils import get_logger
 
 logger = get_logger("medagent.vectorstore")
 
-_store_instance = None
-_emb_instance = None
+_client = None
+_collection = None
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_PERSIST_DIR = os.path.join(BASE_DIR, "data", "db")
+DEFAULT_PERSIST_DIR = "./data/db"
 
-def _get_embeddings() -> Embeddings:
-    global _emb_instance
-    if _emb_instance is None:
-        _emb_instance = get_embeddings_model()
-    return _emb_instance
+def _get_persist_dir(persist_dir: str | None = None) -> str:
+    if persist_dir:
+        return os.path.abspath(persist_dir)
+    env_dir = os.getenv("CHROMA_PERSIST_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+    return os.path.abspath("./data/db")
 
-def get_vector_store(persist_dir: str | None = None) -> Chroma:
-    global _store_instance
-    if _store_instance is None:
-        if persist_dir is None:
-            persist_dir = DEFAULT_PERSIST_DIR
-        else:
-            if not os.path.isabs(persist_dir):
-                persist_dir = os.path.join(BASE_DIR, persist_dir)
-
-        persist_dir = os.path.abspath(persist_dir)
+def _get_client(persist_dir: str | None = None):
+    global _client
+    if _client is None:
+        persist_dir = _get_persist_dir(persist_dir)
         Path(persist_dir).parent.mkdir(parents=True, exist_ok=True)
 
-        _store_instance = Chroma(
+        # FIX: 双重保险，确保遥测被禁用（环境变量已在 app.py 中设置，此处再次确认）
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
+        _client = chromadb.Client(Settings(
             persist_directory=persist_dir,
-            embedding_function=_get_embeddings(),
-        )
+            anonymized_telemetry=False,
+            is_persistent=True,
+        ))
+        logger.info(f"Chroma client initialized at {persist_dir}")
 
-        count = _store_instance._collection.count()
-        logger.info(f"Initialized at {persist_dir}, collection count: {count}")
+    return _client
 
-    return _store_instance
+def _get_collection(name: str = "documents", persist_dir: str | None = None):
+    global _collection
+    if _collection is None:
+        client = _get_client(persist_dir)
+        _collection = client.get_or_create_collection(name=name)
+        logger.info(f"Collection '{name}' loaded, count: {_collection.count()}")
+
+    return _collection
 
 def add_documents_to_store(
-    documents: list[Document],
+    documents: list,
     persist_dir: str | None = None,
-    batch_size: int = 5000,
-) -> Chroma:
-    store = get_vector_store(persist_dir)
+    batch_size: int = 10,
+):
+    collection = _get_collection(persist_dir=persist_dir)
 
     total = len(documents)
     if total == 0:
         logger.warning("No documents to add")
-        return store
+        return
 
-    count_before = store._collection.count()
+    count_before = collection.count()
     logger.debug(f"Collection count before: {count_before}")
 
     for i in range(0, total, batch_size):
         batch = documents[i:i + batch_size]
-        ids = [f"doc_{count_before + i + j}" for j in range(len(batch))]
-        store.add_documents(batch, ids=ids)
-        logger.info(f"Added {min(i + batch_size, total)} / {total} document chunks")
 
-    count_after = store._collection.count()
+        texts = []
+        ids = []
+
+        for j, doc in enumerate(batch):
+            content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+            if not content or len(content.strip()) < 2:
+                continue
+
+            texts.append(content.strip())
+            ids.append(f"doc_{count_before + i + j}")
+
+        if not texts:
+            continue
+
+        logger.debug(f"Processing batch {i//batch_size + 1}, texts: {len(texts)}")
+
+        try:
+            embeddings = embed_texts(texts)
+            logger.debug(f"Got {len(embeddings)} embeddings")
+
+            collection.add(
+                documents=texts,
+                embeddings=embeddings,
+                ids=ids
+            )
+            logger.info(f"Added {min(i + len(texts), total)} / {total} document chunks")
+
+        except Exception as e:
+            logger.error(f"Failed batch {i//batch_size + 1}: {e}")
+            raise
+
+    count_after = collection.count()
     logger.info(f"Collection count after: {count_after} (new: {count_after - count_before})")
-
-    return store
 
 def similarity_search(
     query: str,
@@ -78,29 +110,49 @@ def similarity_search(
     score_threshold: float | None = None,
     persist_dir: str | None = None,
 ) -> list[str]:
-    store = get_vector_store(persist_dir)
+    """相似度检索"""
+    collection = _get_collection(persist_dir=persist_dir)
 
-    count = store._collection.count()
+    count = collection.count()
     if count == 0:
         logger.warning("Collection is empty, cannot retrieve")
         return []
 
-    results = store.similarity_search_with_relevance_scores(query, k=k)
+    try:
+        query_embeddings = embed_texts([query])
+        query_embedding = query_embeddings[0]
+    except Exception as e:
+        logger.error(f"Failed to embed query: {e}")
+        return []
 
-    if not results:
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=k,
+        include=["documents", "distances"]
+    )
+
+    if not results or not results["documents"]:
         logger.info(f"No documents retrieved for: '{query[:30]}...'")
         return []
 
-    threshold = score_threshold if score_threshold is not None else 0.45
-    filtered = [doc.page_content for doc, score in results if score > threshold]
+    documents = results["documents"][0]
+    distances = results["distances"][0] if "distances" in results else [0] * len(documents)
 
-    logger.info(f"Retrieved '{query[:30]}...' -> {len(results)} raw, {len(filtered)} after threshold {threshold}")
-    for i, (doc, score) in enumerate(results):
-        flag = "✓" if score > threshold else "✗"
-        logger.debug(f"  [{flag}] score={score:.3f}: {doc.page_content[:60]}...")
+    # FIX: 默认阈值 0.3（更宽松），支持自定义
+    threshold = score_threshold if score_threshold is not None else 0.3
 
-    if not filtered and results:
-        filtered = [doc.page_content for doc, score in results[:2]]
+    filtered = []
+    for doc, dist in zip(documents, distances):
+        score = 1.0 - min(dist, 1.0)
+        logger.debug(f"  score={score:.3f}: {doc[:60]}...")
+        if score > threshold:
+            filtered.append(doc)
+
+    logger.info(f"Retrieved '{query[:30]}...' -> {len(documents)} raw, {len(filtered)} after threshold {threshold}")
+
+    # FIX: 如果过滤后为空，强制返回 top-2（避免"未找到"）
+    if not filtered and documents:
+        filtered = documents[:2]
         logger.info(f"Threshold filtered to empty, fallback to top-{len(filtered)}")
 
     return filtered
