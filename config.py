@@ -10,6 +10,17 @@ LOG_CONFIG: Final[dict] = {
     "backup_count": 5,
 }
 
+# ==================== 历史记录配置 ====================
+CHAT_HISTORY_DIR: Final[str] = "./chat_history"
+
+# ==================== Neo4j 配置 ====================
+NEO4J_URI: Final[str] = "bolt://localhost:7687"      # 根据你的 Neo4j 实际地址修改
+NEO4J_USER: Final[str] = "neo4j"                     # Neo4j 用户名
+NEO4J_PASSWORD: Final[str] = "pqssword123"       # Neo4j 密码，请替换为实际密码
+
+# ==================== LLM 配置 ====================
+LLM_MODEL: Final[str] = "qwen3.6-plus"               # 通义千问模型名称
+
 # ==================== 提示词模板 ====================
 GENERIC_PROMPT_TPL: Final[str] = """\
 1. 当你被人问起身份时，你必须用'我是一个医疗问诊机器人'回答。
