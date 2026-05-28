@@ -1,4 +1,6 @@
 """Gradio 前端"""
+from dotenv import load_dotenv
+load_dotenv()
 
 import os
 # FIX: 在导入任何可能加载 ChromaDB 的模块之前，彻底禁用遥测

@@ -98,8 +98,9 @@ def _is_medicine(entity: str) -> bool:
     return True
 
 
+from models import get_llm_model
 def get_llm():
-    return ChatTongyi(model=LLM_MODEL, temperature=0.1)
+    return get_llm_model()
 
 
 def get_medical_graph():
@@ -132,7 +133,7 @@ class MedicalGraph:
 
     def query_disease_drugs(self, disease_name: str) -> List[str]:
         cypher = """
-        MATCH (d:Disease {name: $name})-[:TREATED_BY]->(drug:Drug)
+        MATCH (d:Disease {name: $name})-[:DISEASE_DRUG]->(drug:Drug)
         RETURN drug.name AS drug
         """
         result = self.query(cypher, {"name": disease_name})
@@ -177,7 +178,7 @@ class MedicalGraph:
     def query_by_template(self, template_key: str, entity: str) -> str:
         templates = {
             "symptom": "MATCH (d:Disease {name: $entity})-[:HAS_SYMPTOM]->(s:Symptom) RETURN s.name AS name",
-            "drug": "MATCH (d:Disease {name: $entity})-[:TREATED_BY]->(drug:Drug) RETURN drug.name AS name",
+            "drug": "MATCH (d:Disease {name: $entity})-[:DISEASE_DRUG]->(drug:Drug) RETURN drug.name AS name",
             "treatment": "MATCH (d:Disease {name: $entity})-[:TREATED_WITH]->(t:Treatment) RETURN t.name AS name",
             "check": "MATCH (d:Disease {name: $entity})-[:NEEDS_CHECK]->(c:Checkup) RETURN c.name AS name",
             "department": "MATCH (d:Disease {name: $entity})-[:BELONGS_TO]->(dep:Department) RETURN dep.name AS name",

@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 """Neo4j 医疗知识图谱封装"""
 
 import os
@@ -25,7 +28,7 @@ class MedicalGraphStore:
     def __init__(self):
         uri = get_env("NEO4J_URI", "bolt://localhost:7687")
         user = get_env("NEO4J_USER", "neo4j")
-        password = get_env("NEO4J_PASSWORD", "password")
+        password = get_env("NEO4J_PASSWORD", "password123")
         self.driver = GraphDatabase.driver(
             uri,
             auth=(user, password),

@@ -12,7 +12,7 @@ logger = get_logger("medagent.models")
 def get_llm_model(model_name: str = None) -> ChatOpenAI:
     """获取阿里云 DashScope LLM"""
     if model_name is None:
-        model_name = get_env("DASHSCOPE_MODEL", "qwen3.6-plus")
+        model_name = get_env("DASHSCOPE_MODEL", "qwen-plus")
 
     api_key = get_env("DASHSCOPE_API_KEY")
     if not api_key:

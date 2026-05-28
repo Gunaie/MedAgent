@@ -16,7 +16,7 @@ CHAT_HISTORY_DIR: Final[str] = "./chat_history"
 # ==================== Neo4j 配置 ====================
 NEO4J_URI: Final[str] = "bolt://localhost:7687"      # 根据你的 Neo4j 实际地址修改
 NEO4J_USER: Final[str] = "neo4j"                     # Neo4j 用户名
-NEO4J_PASSWORD: Final[str] = "pqssword123"       # Neo4j 密码，请替换为实际密码
+NEO4J_PASSWORD: Final[str] = "password123"       # Neo4j 密码，请替换为实际密码
 
 # ==================== LLM 配置 ====================
 LLM_MODEL: Final[str] = "qwen3.6-plus"               # 通义千问模型名称

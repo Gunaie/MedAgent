@@ -101,6 +101,31 @@ def _extract_topic_from_history(history: list) -> str:
         if entities:
             logger.info(f"Topic from entities: {entities[0]}")
             return entities[0]
+
+    # FIX: 从用户提问中提取实体（兜底）
+    for msg in reversed(history):
+        content = _get_message_content(msg)
+        if not content:
+            continue
+        # 只查用户消息（role=user 或没有 role 标记的）
+        if hasattr(msg, 'type') and msg.type == 'human':
+            entities = _extract_entities_fast(content)
+            if entities:
+                logger.info(f"Topic from user query: {entities[0]}")
+                return entities[0]
+        # 兼容字符串格式
+        elif isinstance(msg, dict) and msg.get('role') == 'user':
+            entities = _extract_entities_fast(content)
+            if entities:
+                logger.info(f"Topic from user query: {entities[0]}")
+                return entities[0]
+        elif isinstance(content, str):
+            # 如果历史记录是纯字符串列表，尝试提取
+            entities = _extract_entities_fast(content)
+            if entities:
+                logger.info(f"Topic from history string: {entities[0]}")
+                return entities[0]
+
     return ""
 
 
@@ -297,11 +322,14 @@ class ChatService:
 
         try:
             result = tool.run(message)
-            logger.info(f"Result: {result[:200]}...")
+            result_text = result.content if hasattr(result, "content") else str(result)
+            logger.info(f"Result: {result_text[:200]}...")
         except Exception as e:
             logger.error(f"Tool error: {e}", exc_info=True)
             result = "抱歉，系统暂时无法回答该问题。"
 
+        # 确保 result 是字符串
+        final_result = result.content if hasattr(result, "content") else str(result)
         self.history.add_user_message(original_message)
-        self.history.add_ai_message(result)
-        return result
+        self.history.add_ai_message(final_result)
+        return final_result
